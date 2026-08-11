@@ -175,6 +175,89 @@ final class AutoSleepCSVImporterTests: XCTestCase {
 		)
 	}
 
+	func testYieldsRowBeforeEOFAcrossQuotedChunkBoundaries() async throws {
+		let header_line = progressiveHeaders.joined(separator: ",")
+		let first_chunk = header_line + "\r\n" + progressiveRowPrefix
+		let second_chunk = "\r\nchunks, with \"\"quote\"\"\",86,2\r\n"
+		let third_chunk = makeProgressiveRow(note: "later row", efficiency: 91)
+		let reader = ControlledCSVChunkReader(
+			chunks: [first_chunk, second_chunk, third_chunk],
+			releasedCount: 2
+		)
+		let source = ControlledCSVChunkSource(reader: reader)
+		let importer = AutoSleepCSVImporter(
+			timeZone: TimeZone(identifier: "Asia/Taipei")!,
+			chunkSource: source
+		)
+		let parse_stream = importer.parse(fileURL: URL(fileURLWithPath: "/unused.csv"))
+		let collector = ParsedRecordCollector()
+		let consumer = Task {
+			for try await record in parse_stream {
+				await collector.append(record)
+			}
+		}
+
+		await collector.waitForCount(1)
+		await reader.waitForReadCount(3)
+		let collected_record = await collector.record(at: 0)
+		let first_record = try XCTUnwrap(collected_record)
+		let eof_released = await reader.isEOFReleased()
+
+		XCTAssertEqual(first_record.efficiency, 86)
+		XCTAssertEqual(first_record.sessionsInNight, 2)
+		XCTAssertFalse(eof_released)
+
+		await reader.releaseAll()
+		try await consumer.value
+		let summary = try await parse_stream.summary()
+		let count_records = await collector.count()
+		let reader_closed = await reader.isClosed()
+
+		XCTAssertEqual(count_records, 2)
+		XCTAssertEqual(summary.parsedCount, 2)
+		XCTAssertTrue(reader_closed)
+	}
+
+	func testCancellationStopsFurtherChunkReadsAndClosesReader() async throws {
+		let first_chunk = progressiveHeaders.joined(separator: ",")
+			+ "\r\n" + makeProgressiveRow(note: "first", efficiency: 86)
+		let reader = ControlledCSVChunkReader(
+			chunks: [first_chunk, makeProgressiveRow(note: "blocked", efficiency: 90)],
+			releasedCount: 1
+		)
+		let source = ControlledCSVChunkSource(reader: reader)
+		let importer = AutoSleepCSVImporter(
+			timeZone: TimeZone(identifier: "Asia/Taipei")!,
+			chunkSource: source
+		)
+		let parse_stream = importer.parse(fileURL: URL(fileURLWithPath: "/unused.csv"))
+		let collector = ParsedRecordCollector()
+		let consumer = Task {
+			for try await record in parse_stream {
+				await collector.append(record)
+			}
+		}
+
+		await collector.waitForCount(1)
+		await reader.waitForReadCount(2)
+		consumer.cancel()
+		_ = try? await consumer.value
+		await reader.waitUntilClosed()
+		let count_reads = await reader.readCount()
+		let reader_closed = await reader.isClosed()
+
+		XCTAssertEqual(count_reads, 2)
+		XCTAssertTrue(reader_closed)
+		do {
+			_ = try await parse_stream.summary()
+			XCTFail("Expected parser cancellation")
+		} catch is CancellationError {
+			// Cancellation is the expected parse result.
+		} catch {
+			XCTFail("Unexpected cancellation error: \(error)")
+		}
+	}
+
 	private var requiredHeaders: [String] {
 		[
 			"startDate", "endDate", "bedtime", "wakeTime", "inBed", "awake",
@@ -188,6 +271,30 @@ final class AutoSleepCSVImporterTests: XCTestCase {
 			"2026-08-08 23:18:00", "2026-08-09 07:28:00", "08:10:00",
 			"00:28:00", "07:42:00", "01:45:00", "86", "1"
 		]
+	}
+
+	private var progressiveHeaders: [String] {
+		[
+			"startDate", "endDate", "bedtime", "wakeTime", "inBed", "awake",
+			"asleep", "deep", "notes", "efficiency", "sessions"
+		]
+	}
+
+	private var progressiveRowPrefix: String {
+		[
+			"2026-08-08 23:18:00", "2026-08-09 07:28:00",
+			"2026-08-08 23:18:00", "2026-08-09 07:28:00", "08:10:00",
+			"00:28:00", "07:42:00", "01:45:00"
+		].joined(separator: ",") + ",\"split across"
+	}
+
+	private func makeProgressiveRow(note: String, efficiency: Int) -> String {
+		[
+			"2026-08-09 23:00:00", "2026-08-10 07:00:00",
+			"2026-08-09 23:00:00", "2026-08-10 07:00:00", "08:00:00",
+			"00:30:00", "07:30:00", "01:30:00", "\"\(note)\"",
+			String(efficiency), "1"
+		].joined(separator: ",") + "\r\n"
 	}
 
 	private func makeHeader(delimiter: String = ",") -> String {
@@ -238,5 +345,156 @@ final class AutoSleepCSVImporterTests: XCTestCase {
 
 	private func removeTemporaryFile(_ file_url: URL) {
 		try? FileManager.default.removeItem(at: file_url.deletingLastPathComponent())
+	}
+}
+
+private struct ControlledCSVChunkSource: CSVChunkSource {
+	let reader: ControlledCSVChunkReader
+
+	func open(fileURL: URL) throws -> any CSVChunkReader {
+		reader
+	}
+}
+
+private actor ControlledCSVChunkReader: CSVChunkReader {
+	private let chunks: [Data]
+	private var released_count: Int
+	private var is_eof_released = false
+	private var index_next = 0
+	private var count_reads = 0
+	private var is_closed = false
+	private var chunk_waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+	private var read_waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+	private var close_waiters: [CheckedContinuation<Void, Never>] = []
+
+	init(chunks: [String], releasedCount: Int) {
+		self.chunks = chunks.map { Data($0.utf8) }
+		self.released_count = releasedCount
+	}
+
+	func readChunk() async throws -> Data? {
+		count_reads += 1
+		resumeReadWaiters()
+
+		while index_next >= released_count && !is_eof_released {
+			try await waitForRelease()
+		}
+
+		try Task.checkCancellation()
+		guard index_next < released_count else {
+			return nil
+		}
+
+		let chunk = chunks[index_next]
+		index_next += 1
+		return chunk
+	}
+
+	func close() async {
+		is_closed = true
+		is_eof_released = true
+		resumeChunkWaiters()
+		let waiters = close_waiters
+		close_waiters.removeAll()
+		waiters.forEach { $0.resume() }
+	}
+
+	func releaseAll() {
+		released_count = chunks.count
+		is_eof_released = true
+		resumeChunkWaiters()
+	}
+
+	func waitForReadCount(_ expected_count: Int) async {
+		guard count_reads < expected_count else {
+			return
+		}
+
+		await withCheckedContinuation { continuation in
+			read_waiters.append((expected_count, continuation))
+		}
+	}
+
+	func waitUntilClosed() async {
+		guard !is_closed else {
+			return
+		}
+
+		await withCheckedContinuation { continuation in
+			close_waiters.append(continuation)
+		}
+	}
+
+	func readCount() -> Int {
+		count_reads
+	}
+
+	func isEOFReleased() -> Bool {
+		is_eof_released
+	}
+
+	func isClosed() -> Bool {
+		is_closed
+	}
+
+	private func waitForRelease() async throws {
+		let id_waiter = UUID()
+
+		try await withTaskCancellationHandler {
+			await withCheckedContinuation { continuation in
+				chunk_waiters[id_waiter] = continuation
+			}
+			try Task.checkCancellation()
+		} onCancel: {
+			Task {
+				await self.cancelWaiter(id_waiter)
+			}
+		}
+	}
+
+	private func cancelWaiter(_ id_waiter: UUID) {
+		chunk_waiters.removeValue(forKey: id_waiter)?.resume()
+	}
+
+	private func resumeChunkWaiters() {
+		let waiters = chunk_waiters.values
+		chunk_waiters.removeAll()
+		waiters.forEach { $0.resume() }
+	}
+
+	private func resumeReadWaiters() {
+		let ready_waiters = read_waiters.filter { count_reads >= $0.0 }
+		read_waiters.removeAll { count_reads >= $0.0 }
+		ready_waiters.forEach { $0.1.resume() }
+	}
+}
+
+private actor ParsedRecordCollector {
+	private var records: [ParsedSleepRecord] = []
+	private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+	func append(_ record: ParsedSleepRecord) {
+		records.append(record)
+		let ready_waiters = waiters.filter { records.count >= $0.0 }
+		waiters.removeAll { records.count >= $0.0 }
+		ready_waiters.forEach { $0.1.resume() }
+	}
+
+	func waitForCount(_ expected_count: Int) async {
+		guard records.count < expected_count else {
+			return
+		}
+
+		await withCheckedContinuation { continuation in
+			waiters.append((expected_count, continuation))
+		}
+	}
+
+	func record(at index: Int) -> ParsedSleepRecord? {
+		records.indices.contains(index) ? records[index] : nil
+	}
+
+	func count() -> Int {
+		records.count
 	}
 }

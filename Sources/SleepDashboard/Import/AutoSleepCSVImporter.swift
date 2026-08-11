@@ -2,180 +2,141 @@ import Foundation
 
 struct AutoSleepCSVImporter: SleepDataSource {
 	private let time_zone_identifier: String
+	private let chunk_source: any CSVChunkSource
 
-	init(timeZone: TimeZone = .current) {
+	init(
+		timeZone: TimeZone = .current,
+		chunkSource: any CSVChunkSource = FileCSVChunkSource()
+	) {
 		self.time_zone_identifier = timeZone.identifier
+		self.chunk_source = chunkSource
 	}
 
 	func parse(fileURL: URL) -> SleepRecordStream {
 		let time_zone_identifier = self.time_zone_identifier
+		let chunk_source = self.chunk_source
+		let task_box = ParseTaskBox()
+		let pair = AsyncThrowingStream<ParsedSleepRecord, Error>.makeStream(
+			bufferingPolicy: .bufferingOldest(1)
+		)
+		pair.continuation.onTermination = { termination in
+			if case .cancelled = termination {
+				task_box.cancel()
+			}
+		}
 		let parse_task = Task.detached {
-			try Self.parseFile(
+			try await Self.parseFile(
 				fileURL: fileURL,
-				timeZoneIdentifier: time_zone_identifier
+				timeZoneIdentifier: time_zone_identifier,
+				chunkSource: chunk_source,
+				continuation: pair.continuation
 			)
 		}
-		let records = AsyncThrowingStream<ParsedSleepRecord, Error> { continuation in
-			let delivery_task = Task {
-				do {
-					let output = try await parse_task.value
+		task_box.set(parse_task)
 
-					for record in output.records {
-						try Task.checkCancellation()
-						continuation.yield(record)
-					}
-
-					continuation.finish()
-				} catch {
-					continuation.finish(throwing: error)
-				}
-			}
-
-			continuation.onTermination = { termination in
-				if case .cancelled = termination {
-					delivery_task.cancel()
-				}
-			}
-		}
-		let summary_task = Task {
-			try await parse_task.value.summary
-		}
-
-		return SleepRecordStream(records: records, summaryTask: summary_task)
+		return SleepRecordStream(records: pair.stream, summaryTask: parse_task)
 	}
 
 	private static func parseFile(
 		fileURL: URL,
-		timeZoneIdentifier: String
-	) throws -> ParsedFileOutput {
-		let data: Data
+		timeZoneIdentifier: String,
+		chunkSource: any CSVChunkSource,
+		continuation: AsyncThrowingStream<ParsedSleepRecord, Error>.Continuation
+	) async throws -> SleepParseSummary {
+		let reader: any CSVChunkReader
 
 		do {
-			data = try Data(contentsOf: fileURL)
+			reader = try chunkSource.open(fileURL: fileURL)
 		} catch {
-			throw AutoSleepCSVImportError.unreadableFile(fileURL.lastPathComponent)
-		}
-
-		guard var text = String(data: data, encoding: .utf8) else {
-			throw AutoSleepCSVImportError.invalidUTF8
-		}
-
-		if text.first == "\u{FEFF}" {
-			text.removeFirst()
-		}
-
-		let directive = removeSeparatorDirective(from: text)
-		text = directive.text
-		guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-			throw AutoSleepCSVImportError.emptyFile
-		}
-
-		let delimiter = directive.delimiter ?? detectDelimiter(in: text)
-		let csv_records = parseCSV(text, delimiter: delimiter)
-		guard let header_record = csv_records.first else {
-			throw AutoSleepCSVImportError.emptyFile
-		}
-		guard header_record.issue == nil else {
-			throw AutoSleepCSVImportError.invalidHeader(
-				header_record.issue ?? "unknown quoting error"
+			let import_error = AutoSleepCSVImportError.unreadableFile(
+				fileURL.lastPathComponent
 			)
+			continuation.finish(throwing: import_error)
+			throw import_error
 		}
 
-		let columns = try resolveColumns(header_record.fields)
-		let parser = RowParser(
-			columns: columns,
+		do {
+			let summary = try await consumeFile(
+				reader: reader,
+				fileURL: fileURL,
+				timeZoneIdentifier: timeZoneIdentifier,
+				continuation: continuation
+			)
+			await reader.close()
+			continuation.finish()
+			return summary
+		} catch {
+			await reader.close()
+			continuation.finish(throwing: error)
+			throw error
+		}
+	}
+
+	private static func consumeFile(
+		reader: any CSVChunkReader,
+		fileURL: URL,
+		timeZoneIdentifier: String,
+		continuation: AsyncThrowingStream<ParsedSleepRecord, Error>.Continuation
+	) async throws -> SleepParseSummary {
+		var decoder = IncrementalCSVDecoder()
+		var row_consumer = CSVRowConsumer(
 			timeZoneIdentifier: timeZoneIdentifier,
 			sourceFile: fileURL.lastPathComponent
 		)
-		var parsed_records: [ParsedSleepRecord] = []
-		var skipped_rows: [SleepSkippedRow] = []
 
-		for csv_record in csv_records.dropFirst() where !csv_record.isBlank {
-			do {
-				try Task.checkCancellation()
-				let record = try parser.parse(csv_record, headerCount: header_record.fields.count)
-				parsed_records.append(record)
-			} catch is CancellationError {
-				throw CancellationError()
-			} catch {
-				skipped_rows.append(
-					SleepSkippedRow(
-						rowNumber: csv_record.rowNumber,
-						reason: error.localizedDescription
-					)
-				)
-			}
-		}
-
-		return ParsedFileOutput(
-			records: parsed_records,
-			summary: SleepParseSummary(
-				parsedCount: parsed_records.count,
-				skippedRows: skipped_rows
+		while let chunk = try await reader.readChunk() {
+			try Task.checkCancellation()
+			let csv_records = try decoder.consume(chunk)
+			try await consumeRows(
+				csv_records,
+				consumer: &row_consumer,
+				continuation: continuation
 			)
+		}
+
+		try await consumeRows(
+			try decoder.finish(),
+			consumer: &row_consumer,
+			continuation: continuation
 		)
+		return try row_consumer.finish()
 	}
 
-	private static func removeSeparatorDirective(
-		from text: String
-	) -> (text: String, delimiter: Character?) {
-		let scalars = text.unicodeScalars
-		let line_end = scalars.firstIndex { $0.value == 10 } ?? scalars.endIndex
-		let first_line = String(scalars[..<line_end])
-			.trimmingCharacters(in: .whitespacesAndNewlines)
-			.lowercased()
-		let delimiter: Character?
+	private static func consumeRows(
+		_ csvRecords: [CSVRecord],
+		consumer: inout CSVRowConsumer,
+		continuation: AsyncThrowingStream<ParsedSleepRecord, Error>.Continuation
+	) async throws {
+		for csv_record in csvRecords {
+			try Task.checkCancellation()
 
-		if first_line == "sep=;" {
-			delimiter = ";"
-		} else if first_line == "sep=," {
-			delimiter = ","
-		} else {
-			return (text, nil)
-		}
-
-		guard line_end != scalars.endIndex else {
-			return ("", delimiter)
-		}
-
-		let content_start = scalars.index(after: line_end)
-		return (String(scalars[content_start...]), delimiter)
-	}
-
-	private static func detectDelimiter(in text: String) -> Character {
-		let scalars = Array(text.unicodeScalars)
-		var comma_count = 0
-		var semicolon_count = 0
-		var is_quoted = false
-		var index = 0
-
-		while index < scalars.count {
-			let scalar = scalars[index]
-
-			if scalar.value == 34 {
-				if is_quoted, index + 1 < scalars.count, scalars[index + 1].value == 34 {
-					index += 2
-					continue
-				}
-
-				is_quoted.toggle()
-			} else if !is_quoted {
-				if scalar.value == 44 {
-					comma_count += 1
-				} else if scalar.value == 59 {
-					semicolon_count += 1
-				} else if scalar.value == 10 || scalar.value == 13 {
-					break
-				}
+			if let parsed_record = try consumer.consume(csv_record) {
+				try await yield(parsed_record, continuation: continuation)
 			}
-
-			index += 1
 		}
-
-		return semicolon_count > comma_count ? ";" : ","
 	}
 
-	private static func resolveColumns(_ headers: [String]) throws -> [CSVColumn: Int] {
+	private static func yield(
+		_ record: ParsedSleepRecord,
+		continuation: AsyncThrowingStream<ParsedSleepRecord, Error>.Continuation
+	) async throws {
+		while true {
+			try Task.checkCancellation()
+
+			switch continuation.yield(record) {
+			case .enqueued:
+				return
+			case .dropped:
+				await Task.yield()
+			case .terminated:
+				throw CancellationError()
+			@unknown default:
+				throw CancellationError()
+			}
+		}
+	}
+
+	fileprivate static func resolveColumns(_ headers: [String]) throws -> [CSVColumn: Int] {
 		var columns: [CSVColumn: Int] = [:]
 
 		for (index, header) in headers.enumerated() {
@@ -204,9 +165,88 @@ struct AutoSleepCSVImporter: SleepDataSource {
 	}
 }
 
-private struct ParsedFileOutput: Sendable {
-	let records: [ParsedSleepRecord]
-	let summary: SleepParseSummary
+private final class ParseTaskBox: @unchecked Sendable {
+	private let lock = NSLock()
+	private var task: Task<SleepParseSummary, Error>?
+	private var is_cancelled = false
+
+	func set(_ task: Task<SleepParseSummary, Error>) {
+		lock.lock()
+		self.task = task
+		let should_cancel = is_cancelled
+		lock.unlock()
+
+		if should_cancel {
+			task.cancel()
+		}
+	}
+
+	func cancel() {
+		lock.lock()
+		is_cancelled = true
+		let task = self.task
+		lock.unlock()
+		task?.cancel()
+	}
+}
+
+private struct CSVRowConsumer {
+	let timeZoneIdentifier: String
+	let sourceFile: String
+	private var row_parser: RowParser?
+	private var count_headers = 0
+	private var count_parsed = 0
+	private var skipped_rows: [SleepSkippedRow] = []
+
+	init(timeZoneIdentifier: String, sourceFile: String) {
+		self.timeZoneIdentifier = timeZoneIdentifier
+		self.sourceFile = sourceFile
+	}
+
+	mutating func consume(_ csv_record: CSVRecord) throws -> ParsedSleepRecord? {
+		guard let row_parser else {
+			guard csv_record.issue == nil else {
+				throw AutoSleepCSVImportError.invalidHeader(
+					csv_record.issue ?? "unknown quoting error"
+				)
+			}
+
+			let columns = try AutoSleepCSVImporter.resolveColumns(csv_record.fields)
+			self.row_parser = RowParser(
+				columns: columns,
+				timeZoneIdentifier: timeZoneIdentifier,
+				sourceFile: sourceFile
+			)
+			count_headers = csv_record.fields.count
+			return nil
+		}
+
+		guard !csv_record.isBlank else {
+			return nil
+		}
+
+		do {
+			let record = try row_parser.parse(csv_record, headerCount: count_headers)
+			count_parsed += 1
+			return record
+		} catch {
+			skipped_rows.append(
+				SleepSkippedRow(
+					rowNumber: csv_record.rowNumber,
+					reason: error.localizedDescription
+				)
+			)
+			return nil
+		}
+	}
+
+	func finish() throws -> SleepParseSummary {
+		guard row_parser != nil else {
+			throw AutoSleepCSVImportError.emptyFile
+		}
+
+		return SleepParseSummary(parsedCount: count_parsed, skippedRows: skipped_rows)
+	}
 }
 
 private struct RowParser: Sendable {
@@ -458,105 +498,303 @@ private enum CSVState {
 	case quoteClosed
 }
 
-private func parseCSV(_ text: String, delimiter: Character) -> [CSVRecord] {
-	let scalars = Array(text.unicodeScalars)
-	let delimiter_value = delimiter.unicodeScalars.first?.value ?? 44
-	var records: [CSVRecord] = []
-	var fields: [String] = []
-	var field = ""
-	var raw = ""
-	var issue: String?
-	var state = CSVState.unquoted
-	var row_number = 1
-	var index = 0
+private enum IncrementalCSVStage {
+	case preamble
+	case records
+}
 
-	func finishRecord() {
-		fields.append(field)
-		records.append(
-			CSVRecord(fields: fields, raw: raw, rowNumber: row_number, issue: issue)
-		)
-		fields = []
-		field = ""
-		raw = ""
-		issue = nil
-		state = .unquoted
+private struct IncrementalCSVDecoder {
+	private var stage = IncrementalCSVStage.preamble
+	private var leading_bytes: [UInt8] = []
+	private var did_process_leading_bytes = false
+	private var preamble_bytes: [UInt8] = []
+	private var csv_parser: CSVByteStateMachine?
+	private var should_skip_preamble_lf = false
+
+	mutating func consume(_ data: Data) throws -> [CSVRecord] {
+		var records: [CSVRecord] = []
+
+		for byte in data {
+			try consumeLeadingByte(byte, records: &records)
+		}
+
+		return records
 	}
 
-	while index < scalars.count {
-		let scalar = scalars[index]
-		let scalar_text = String(scalar)
+	mutating func finish() throws -> [CSVRecord] {
+		var records: [CSVRecord] = []
 
-		switch state {
-		case .unquoted:
-			if scalar.value == delimiter_value {
-				fields.append(field)
-				field = ""
-				raw.append(scalar_text)
-			} else if scalar.value == 34, field.isEmpty {
-				state = .quoted
-				raw.append(scalar_text)
-			} else if scalar.value == 34 {
-				issue = issue ?? "A quote appeared inside an unquoted field."
-				field.append(scalar_text)
-				raw.append(scalar_text)
-			} else if scalar.value == 13 || scalar.value == 10 {
-				finishRecord()
-				if scalar.value == 13,
-					index + 1 < scalars.count,
-					scalars[index + 1].value == 10 {
-					index += 1
-				}
-				row_number += 1
-			} else {
-				field.append(scalar_text)
-				raw.append(scalar_text)
-			}
-		case .quoted:
-			if scalar.value == 34,
-				index + 1 < scalars.count,
-				scalars[index + 1].value == 34 {
-				field.append("\"")
-				raw.append("\"\"")
-				index += 1
-			} else if scalar.value == 34 {
-				state = .quoteClosed
-				raw.append(scalar_text)
-			} else {
-				field.append(scalar_text)
-				raw.append(scalar_text)
-				if scalar.value == 10 {
-					row_number += 1
-				}
-			}
-		case .quoteClosed:
-			if scalar.value == delimiter_value {
-				fields.append(field)
-				field = ""
-				state = .unquoted
-				raw.append(scalar_text)
-			} else if scalar.value == 13 || scalar.value == 10 {
-				finishRecord()
-				if scalar.value == 13,
-					index + 1 < scalars.count,
-					scalars[index + 1].value == 10 {
-					index += 1
-				}
-				row_number += 1
-			} else {
-				issue = issue ?? "Unexpected text followed a closing quote."
-				raw.append(scalar_text)
+		if !did_process_leading_bytes {
+			did_process_leading_bytes = true
+			try consumeBodyBytes(leading_bytes, records: &records)
+			leading_bytes.removeAll(keepingCapacity: false)
+		}
+
+		if stage == .preamble {
+			try finishPreamble(terminator: nil, records: &records)
+		}
+		if let final_record = try csv_parser?.finish() {
+			records.append(final_record)
+		}
+
+		return records
+	}
+
+	private mutating func consumeLeadingByte(
+		_ byte: UInt8,
+		records: inout [CSVRecord]
+	) throws {
+		guard !did_process_leading_bytes else {
+			try consumeBodyByte(byte, records: &records)
+			return
+		}
+
+		leading_bytes.append(byte)
+		guard leading_bytes.count == 3 else {
+			return
+		}
+
+		did_process_leading_bytes = true
+		if leading_bytes != [0xEF, 0xBB, 0xBF] {
+			try consumeBodyBytes(leading_bytes, records: &records)
+		}
+		leading_bytes.removeAll(keepingCapacity: false)
+	}
+
+	private mutating func consumeBodyBytes(
+		_ bytes: [UInt8],
+		records: inout [CSVRecord]
+	) throws {
+		for byte in bytes {
+			try consumeBodyByte(byte, records: &records)
+		}
+	}
+
+	private mutating func consumeBodyByte(
+		_ byte: UInt8,
+		records: inout [CSVRecord]
+	) throws {
+		if should_skip_preamble_lf {
+			should_skip_preamble_lf = false
+			if byte == 10 {
+				return
 			}
 		}
 
-		index += 1
+		switch stage {
+		case .preamble:
+			if byte == 13 || byte == 10 {
+				try finishPreamble(terminator: byte, records: &records)
+				should_skip_preamble_lf = byte == 13
+			} else {
+				preamble_bytes.append(byte)
+			}
+		case .records:
+			if let record = try csv_parser?.consume(byte) {
+				records.append(record)
+			}
+		}
 	}
 
-	if state == .quoted {
-		issue = issue ?? "A quoted field was not closed."
-	}
-	if !fields.isEmpty || !field.isEmpty || !raw.isEmpty {
-		finishRecord()
+	private mutating func finishPreamble(
+		terminator: UInt8?,
+		records: inout [CSVRecord]
+	) throws {
+		let directive = try separatorDirective(in: preamble_bytes)
+		let delimiter = directive ?? detectDelimiter(in: preamble_bytes)
+		let row_number = directive == nil ? 1 : 2
+		csv_parser = CSVByteStateMachine(delimiter: delimiter, rowNumber: row_number)
+		stage = .records
+
+		if directive == nil {
+			for byte in preamble_bytes {
+				_ = try csv_parser?.consume(byte)
+			}
+			if let terminator, let record = try csv_parser?.consume(terminator) {
+				records.append(record)
+			}
+		}
+
+		preamble_bytes.removeAll(keepingCapacity: false)
 	}
 
-	return records
+	private func separatorDirective(in bytes: [UInt8]) throws -> UInt8? {
+		guard let line = String(data: Data(bytes), encoding: .utf8) else {
+			throw AutoSleepCSVImportError.invalidUTF8
+		}
+
+		switch line.trimmingCharacters(in: .whitespaces).lowercased() {
+		case "sep=;": return 59
+		case "sep=,": return 44
+		default: return nil
+		}
+	}
+
+	private func detectDelimiter(in bytes: [UInt8]) -> UInt8 {
+		var comma_count = 0
+		var semicolon_count = 0
+		var is_quoted = false
+		var is_quote_pending = false
+
+		for byte in bytes {
+			if byte == 34 {
+				if is_quote_pending {
+					is_quote_pending = false
+				} else if is_quoted {
+					is_quote_pending = true
+				} else {
+					is_quoted = true
+				}
+			} else if is_quote_pending {
+				is_quoted = false
+				is_quote_pending = false
+			}
+
+			if !is_quoted {
+				comma_count += byte == 44 ? 1 : 0
+				semicolon_count += byte == 59 ? 1 : 0
+			}
+		}
+
+		return semicolon_count > comma_count ? 59 : 44
+	}
+}
+
+private struct CSVByteStateMachine {
+	private let delimiter: UInt8
+	private var fields: [[UInt8]] = []
+	private var field: [UInt8] = []
+	private var raw: [UInt8] = []
+	private var issue: String?
+	private var state = CSVState.unquoted
+	private var physical_line: Int
+	private var record_start_line: Int
+	private var should_skip_lf = false
+
+	init(delimiter: UInt8, rowNumber: Int) {
+		self.delimiter = delimiter
+		self.physical_line = rowNumber
+		self.record_start_line = rowNumber
+	}
+
+	mutating func consume(_ byte: UInt8) throws -> CSVRecord? {
+		if should_skip_lf {
+			should_skip_lf = false
+			if byte == 10 {
+				return nil
+			}
+		}
+
+		switch state {
+		case .unquoted:
+			return try consumeUnquoted(byte)
+		case .quoted:
+			consumeQuoted(byte)
+		case .quoteClosed:
+			return try consumeAfterQuote(byte)
+		}
+
+		return nil
+	}
+
+	mutating func finish() throws -> CSVRecord? {
+		if state == .quoted {
+			issue = issue ?? "A quoted field was not closed."
+		}
+		guard !fields.isEmpty || !field.isEmpty || !raw.isEmpty else {
+			return nil
+		}
+
+		return try finishRecord()
+	}
+
+	private mutating func consumeUnquoted(_ byte: UInt8) throws -> CSVRecord? {
+		if byte == delimiter {
+			fields.append(field)
+			field = []
+			raw.append(byte)
+		} else if byte == 34, field.isEmpty {
+			state = .quoted
+			raw.append(byte)
+		} else if byte == 34 {
+			issue = issue ?? "A quote appeared inside an unquoted field."
+			field.append(byte)
+			raw.append(byte)
+		} else if byte == 13 || byte == 10 {
+			return try finishLine(with: byte)
+		} else {
+			field.append(byte)
+			raw.append(byte)
+		}
+
+		return nil
+	}
+
+	private mutating func consumeQuoted(_ byte: UInt8) {
+		raw.append(byte)
+
+		if byte == 34 {
+			state = .quoteClosed
+		} else {
+			field.append(byte)
+			if byte == 10 {
+				physical_line += 1
+			}
+		}
+	}
+
+	private mutating func consumeAfterQuote(_ byte: UInt8) throws -> CSVRecord? {
+		if byte == 34 {
+			field.append(byte)
+			raw.append(byte)
+			state = .quoted
+		} else if byte == delimiter {
+			fields.append(field)
+			field = []
+			raw.append(byte)
+			state = .unquoted
+		} else if byte == 13 || byte == 10 {
+			return try finishLine(with: byte)
+		} else {
+			issue = issue ?? "Unexpected text followed a closing quote."
+			raw.append(byte)
+		}
+
+		return nil
+	}
+
+	private mutating func finishLine(with byte: UInt8) throws -> CSVRecord {
+		let record = try finishRecord()
+		physical_line += 1
+		record_start_line = physical_line
+		should_skip_lf = byte == 13
+		return record
+	}
+
+	private mutating func finishRecord() throws -> CSVRecord {
+		fields.append(field)
+		let decoded_fields = try fields.map { bytes in
+			guard let value = String(data: Data(bytes), encoding: .utf8) else {
+				throw AutoSleepCSVImportError.invalidUTF8
+			}
+
+			return value
+		}
+		guard let raw_value = String(data: Data(raw), encoding: .utf8) else {
+			throw AutoSleepCSVImportError.invalidUTF8
+		}
+		let record = CSVRecord(
+			fields: decoded_fields,
+			raw: raw_value,
+			rowNumber: record_start_line,
+			issue: issue
+		)
+
+		fields = []
+		field = []
+		raw = []
+		issue = nil
+		state = .unquoted
+		return record
+	}
 }
